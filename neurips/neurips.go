@@ -1,10 +1,6 @@
 // Package neurips is the library behind the neurips command line:
-// the HTTP client, request shaping, and the typed data models for neurips.
-//
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// the HTTP client, request shaping, and the typed data models for NeurIPS
+// conference papers fetched from papers.nips.cc.
 package neurips
 
 import (
@@ -12,41 +8,58 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"strings"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to neurips. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "neurips/dev (+https://github.com/tamnd/neurips-cli)"
+// AvailableYears lists NeurIPS proceedings years (newest first).
+var AvailableYears = []int{2025, 2024, 2023, 2022, 2021, 2020, 2019, 2018, 2017, 2016, 2015, 2014, 2013, 2012, 2011}
 
-// Client talks to neurips over HTTP.
-type Client struct {
-	HTTP      *http.Client
+const DefaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+var paperRe = regexp.MustCompile(`title="paper title" href="(/paper_files/paper/\d+/hash/[^"]+)">(.*?)(?:</a>|\.\.\.)`)
+
+// Config holds constructor parameters.
+type Config struct {
+	BaseURL   string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+// DefaultConfig returns sensible defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   "https://papers.nips.cc",
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Rate:      500 * time.Millisecond,
+		Retries:   3,
+		Timeout:   30 * time.Second,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client fetches NeurIPS paper listings.
+type Client struct {
+	cfg        Config
+	httpClient *http.Client
+	mu         sync.Mutex
+	last       time.Time
+}
+
+// NewClient returns a Client with the given config.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:        cfg,
+		httpClient: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -54,27 +67,27 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		b, retry, err := c.do(ctx, rawURL)
 		if err == nil {
-			return body, nil
+			return b, nil
 		}
 		lastErr = err
 		if !retry {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get: %w", lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -87,19 +100,20 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
 	}
 
-	b, err := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {
 		return nil, true, err
 	}
 	return b, false, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -111,4 +125,64 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
+}
+
+// List returns all papers for the given year.
+func (c *Client) List(ctx context.Context, year, limit int) ([]Paper, error) {
+	rawURL := fmt.Sprintf("%s/paper_files/paper/%d", c.cfg.BaseURL, year)
+	raw, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	return parsePapers(string(raw), year, limit, c.cfg.BaseURL), nil
+}
+
+// Search returns papers for the given year whose title contains query (case-insensitive).
+func (c *Client) Search(ctx context.Context, query string, year, limit int) ([]Paper, error) {
+	all, err := c.List(ctx, year, 0)
+	if err != nil {
+		return nil, err
+	}
+	q := strings.ToLower(query)
+	var out []Paper
+	rank := 0
+	for _, p := range all {
+		if strings.Contains(strings.ToLower(p.Title), q) {
+			rank++
+			p.Rank = rank
+			out = append(out, p)
+			if limit > 0 && len(out) >= limit {
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
+// Years returns the list of available NeurIPS years as Year records.
+func Years() []Year {
+	out := make([]Year, len(AvailableYears))
+	for i, y := range AvailableYears {
+		out[i] = Year{Year: y}
+	}
+	return out
+}
+
+func parsePapers(html string, year, limit int, baseURL string) []Paper {
+	matches := paperRe.FindAllStringSubmatch(html, -1)
+	out := make([]Paper, 0, len(matches))
+	for i, m := range matches {
+		if limit > 0 && i >= limit {
+			break
+		}
+		path := m[1]
+		title := strings.TrimSpace(m[2])
+		out = append(out, Paper{
+			Rank:  i + 1,
+			Year:  year,
+			Title: title,
+			URL:   baseURL + path,
+		})
+	}
+	return out
 }
